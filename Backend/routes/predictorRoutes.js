@@ -22,7 +22,7 @@ router.post('/predict', [
   const { rank, category, course } = req.body;
   const userId = req.user?.id || null;
 
-  console.log(`[Predictor] Received prediction request:`, { rank, category, course, userId });
+  console.log(`[${req.id || 'unknown'}] [Predictor] Received prediction request:`, { rank, category, course, userId });
 
   // First, get the latest year for this category
   const [yearResult] = await pool.execute(
@@ -46,45 +46,32 @@ router.post('/predict', [
     });
   }
 
-  console.log(`[Predictor] Using cutoff data from year: ${latestYear}`);
+  console.log(`[${req.id || 'unknown'}] [Predictor] Using cutoff data from year: ${latestYear}`);
 
-  // Get cutoff data for the specified category
-  let cutoffQuery = `
-    SELECT 
-      cd.*,
-      c.id as college_id,
-      c.name as college_name,
-      c.location,
-      c.ranking,
-      co.id as course_id,
-      co.course_name,
-      co.fees,
-      co.duration,
-      co.eligibility
+  // Step 1: Get colleges that have cutoff data for the specified category
+  let collegeQuery = `
+    SELECT DISTINCT cd.college_id
     FROM cutoff_data cd
-    JOIN colleges c ON cd.college_id = c.id
-    JOIN courses co ON cd.course_id = co.id
     WHERE cd.category = ? AND cd.year = ?
   `;
-
-  const params = [category, latestYear];
-
+  
+  const collegeParams = [category, latestYear];
+  
   if (course) {
-    cutoffQuery += ' AND co.course_name LIKE ?';
-    params.push(`%${course}%`);
+    collegeQuery = `
+      SELECT DISTINCT cd.college_id
+      FROM cutoff_data cd
+      JOIN courses co ON cd.course_id = co.id
+      WHERE cd.category = ? AND cd.year = ? AND co.course_name LIKE ?
+    `;
+    collegeParams.push(`%${course}%`);
   }
-
-  cutoffQuery += ' ORDER BY cd.avg_rank ASC LIMIT 200';
-
-  console.log(`[Predictor] Executing query with params:`, params);
   
-  const [cutoffs] = await pool.execute(cutoffQuery, params);
+  const [collegesWithCutoff] = await pool.execute(collegeQuery, collegeParams);
+  const collegeIds = collegesWithCutoff.map(row => row.college_id);
   
-  console.log(`[Predictor] Found ${cutoffs.length} cutoff records`);
-
-  // If no cutoff data found, return empty array with message
-  if (!cutoffs || cutoffs.length === 0) {
-    console.log(`[Predictor] No cutoff data found for criteria: category=${category}, course=${course || 'any'}, year=${latestYear}`);
+  if (collegeIds.length === 0) {
+    console.log(`[${req.id || 'unknown'}] [Predictor] No colleges found with cutoff data`);
     return res.json({
       success: true,
       predictions: [],
@@ -96,78 +83,217 @@ router.post('/predict', [
       }
     });
   }
-
-  // Calculate predictions
-  const predictions = cutoffs.map(cutoff => {
-    // Use avg_rank as primary, fallback to closing_rank, then max_rank
-    const avgRank = cutoff.avg_rank || cutoff.closing_rank || cutoff.max_rank || 0;
-    
-    if (!avgRank || avgRank === 0) {
-      console.warn(`[Predictor] Warning: No valid rank data for college ${cutoff.college_name}, course ${cutoff.course_name}`);
-      return null;
+  
+  // Step 2: Get ALL courses for these colleges (not just ones with cutoff data)
+  let coursesQuery = `
+    SELECT 
+      co.id as course_id,
+      co.course_name,
+      co.fees,
+      co.duration,
+      co.eligibility,
+      co.college_id,
+      c.name as college_name,
+      c.location,
+      c.ranking
+    FROM courses co
+    JOIN colleges c ON co.college_id = c.id
+    WHERE co.college_id IN (${collegeIds.map(() => '?').join(',')})
+  `;
+  
+  const coursesParams = [...collegeIds];
+  
+  if (course) {
+    coursesQuery += ' AND co.course_name LIKE ?';
+    coursesParams.push(`%${course}%`);
+  }
+  
+  coursesQuery += ' ORDER BY co.college_id, co.id';
+  
+  const [allCourses] = await pool.execute(coursesQuery, coursesParams);
+  
+  // Step 3: Get cutoff data for all courses of these colleges
+  let cutoffQuery = `
+    SELECT 
+      cd.*,
+      cd.college_id,
+      cd.course_id
+    FROM cutoff_data cd
+    WHERE cd.college_id IN (${collegeIds.map(() => '?').join(',')})
+      AND cd.category = ? AND cd.year = ?
+  `;
+  
+  const cutoffParams = [...collegeIds, category, latestYear];
+  
+  const [cutoffs] = await pool.execute(cutoffQuery, cutoffParams);
+  
+  // Create a map of cutoff data by college_id and course_id
+  const cutoffMap = {};
+  cutoffs.forEach(cutoff => {
+    const key = `${cutoff.college_id}_${cutoff.course_id}`;
+    if (!cutoffMap[key]) {
+      cutoffMap[key] = [];
     }
-    
-    const rankDiff = rank - avgRank;
-    const rankDiffPercent = avgRank > 0 ? (rankDiff / avgRank) * 100 : 0;
+    cutoffMap[key].push(cutoff);
+  });
+  
+  console.log(`[${req.id || 'unknown'}] [Predictor] Found ${allCourses.length} courses across ${collegeIds.length} colleges with ${cutoffs.length} cutoff records`);
+
+  // Helper to calculate admission probability
+  const calculateProbability = (userRank, cutoffRow) => {
+    const baseRank = cutoffRow.avg_rank || cutoffRow.closing_rank || cutoffRow.max_rank || cutoffRow.opening_rank || 0;
+
+    if (!baseRank || baseRank === 0) {
+      return { probability: 0, category_type: 'reach' };
+    }
+
+    const rankDiff = userRank - baseRank;
+    const rankDiffPercent = baseRank > 0 ? (rankDiff / baseRank) * 100 : 0;
 
     let probability = 0;
     let category_type = 'reach';
 
-    // Calculate probability based on rank difference
-    // Lower rank number = better rank (rank 1 is better than rank 1000)
-    if (rank <= (cutoff.opening_rank || avgRank * 0.7)) {
-      // User's rank is better than opening rank or 70% of average
+    if (userRank <= (cutoffRow.opening_rank || baseRank * 0.7)) {
       probability = 95;
       category_type = 'safe';
-    } else if (rank <= avgRank || (rankDiffPercent <= 10 && rankDiffPercent >= -10)) {
-      // User's rank is close to or better than average
+    } else if (userRank <= baseRank || (rankDiffPercent <= 10 && rankDiffPercent >= -10)) {
       probability = 80;
       category_type = 'safe';
-    } else if (rank <= (avgRank * 1.2) || (rankDiffPercent <= 30 && rankDiffPercent > 10)) {
-      // User's rank is within 20% of average
+    } else if (userRank <= (baseRank * 1.2) || (rankDiffPercent <= 30 && rankDiffPercent > 10)) {
       probability = 65;
       category_type = 'moderate';
-    } else if (rank <= (avgRank * 1.5) || (rankDiffPercent <= 50 && rankDiffPercent > 30)) {
-      // User's rank is within 50% of average
+    } else if (userRank <= (baseRank * 1.5) || (rankDiffPercent <= 50 && rankDiffPercent > 30)) {
       probability = 45;
       category_type = 'moderate';
-    } else if (rank <= (cutoff.closing_rank || cutoff.max_rank || avgRank * 2)) {
-      // User's rank is within closing rank range
+    } else if (userRank <= (cutoffRow.closing_rank || cutoffRow.max_rank || baseRank * 2)) {
       probability = 30;
       category_type = 'reach';
     } else {
-      // User's rank is worse than closing rank
       probability = 15;
       category_type = 'reach';
     }
 
-    return {
-      college_id: cutoff.college_id,
-      college_name: cutoff.college_name,
-      location: cutoff.location,
-      ranking: cutoff.ranking,
-      course_id: cutoff.course_id,
-      course_name: cutoff.course_name,
-      fees: cutoff.fees,
-      duration: cutoff.duration,
-      eligibility: cutoff.eligibility,
-      last_year_cutoff: avgRank,
-      opening_rank: cutoff.opening_rank,
-      closing_rank: cutoff.closing_rank || cutoff.max_rank,
-      probability,
-      category: category_type
-    };
-  }).filter(pred => pred !== null); // Remove any null predictions
+    return { probability, category_type };
+  };
 
-  // Sort by probability (highest first), then by avg_rank (lower is better)
-  predictions.sort((a, b) => {
-    if (b.probability !== a.probability) {
-      return b.probability - a.probability;
+  // Group predictions by college and include ALL courses (with or without cutoff data)
+  const groupedPredictions = {};
+
+  // Process all courses for colleges that have cutoff data
+  allCourses.forEach((courseRow) => {
+    const collegeId = courseRow.college_id;
+    const courseId = courseRow.course_id;
+    const cutoffKey = `${collegeId}_${courseId}`;
+    const cutoffData = cutoffMap[cutoffKey]?.[0]; // Get the first matching cutoff
+
+    // Initialize college if not exists
+    if (!groupedPredictions[collegeId]) {
+      groupedPredictions[collegeId] = {
+        college_id: collegeId,
+        college_name: courseRow.college_name,
+        location: courseRow.location,
+        ranking: courseRow.ranking,
+        availableCourses: [],
+      };
     }
-    return a.last_year_cutoff - b.last_year_cutoff;
+
+    // If cutoff data exists, calculate probability
+    if (cutoffData) {
+      const closingRank = cutoffData.closing_rank || cutoffData.avg_rank || cutoffData.max_rank || cutoffData.min_rank || 0;
+      
+      if (closingRank) {
+        const { probability, category_type } = calculateProbability(rank, cutoffData);
+        
+        const courseEntry = {
+          id: courseId,
+          branch: courseRow.course_name,
+          fees_per_year: courseRow.fees ? Number(courseRow.fees) : null,
+          closing_rank: closingRank,
+          admissionProbability: probability,
+          category: category_type,
+          duration: courseRow.duration,
+          eligibility: courseRow.eligibility,
+        };
+        
+        groupedPredictions[collegeId].availableCourses.push(courseEntry);
+      } else {
+        // Course exists but no valid cutoff data - still include it with low probability
+        const courseEntry = {
+          id: courseId,
+          branch: courseRow.course_name,
+          fees_per_year: courseRow.fees ? Number(courseRow.fees) : null,
+          closing_rank: null,
+          admissionProbability: 0,
+          category: 'reach',
+          duration: courseRow.duration,
+          eligibility: courseRow.eligibility,
+        };
+        
+        groupedPredictions[collegeId].availableCourses.push(courseEntry);
+      }
+    } else {
+      // Course exists but no cutoff data - include it anyway with null cutoff
+      const courseEntry = {
+        id: courseId,
+        branch: courseRow.course_name,
+        fees_per_year: courseRow.fees ? Number(courseRow.fees) : null,
+        closing_rank: null,
+        admissionProbability: 0,
+        category: 'reach',
+        duration: courseRow.duration,
+        eligibility: courseRow.eligibility,
+      };
+      
+      groupedPredictions[collegeId].availableCourses.push(courseEntry);
+    }
   });
 
-  console.log(`[Predictor] Generated ${predictions.length} predictions`);
+  const predictions = Object.values(groupedPredictions).map((college) => {
+    // Sort available courses: first by having cutoff data, then by probability desc, then closing rank asc
+    college.availableCourses.sort((a, b) => {
+      // Courses with cutoff data come first
+      const aHasCutoff = a.closing_rank !== null;
+      const bHasCutoff = b.closing_rank !== null;
+      if (aHasCutoff !== bHasCutoff) {
+        return bHasCutoff ? 1 : -1;
+      }
+      
+      // If both have cutoff data, sort by probability
+      if (aHasCutoff && bHasCutoff) {
+        if (b.admissionProbability !== a.admissionProbability) {
+          return b.admissionProbability - a.admissionProbability;
+        }
+        return (a.closing_rank || Number.MAX_SAFE_INTEGER) - (b.closing_rank || Number.MAX_SAFE_INTEGER);
+      }
+      
+      // If neither has cutoff data, sort alphabetically
+      return a.branch.localeCompare(b.branch);
+    });
+
+    // Default course is the first one with cutoff data, or first course if none have cutoff
+    const defaultCourseId = college.availableCourses.find(c => c.closing_rank !== null)?.id 
+      || college.availableCourses[0]?.id 
+      || null;
+
+    return {
+      ...college,
+      defaultCourseId,
+    };
+  });
+
+  // Sort colleges by their best course probability then cutoff
+  predictions.sort((a, b) => {
+    const aTop = a.availableCourses[0];
+    const bTop = b.availableCourses[0];
+
+    if (bTop?.admissionProbability !== aTop?.admissionProbability) {
+      return (bTop?.admissionProbability || 0) - (aTop?.admissionProbability || 0);
+    }
+
+    return (aTop?.closing_rank || Number.MAX_SAFE_INTEGER) - (bTop?.closing_rank || Number.MAX_SAFE_INTEGER);
+  });
+
+  console.log(`[${req.id || 'unknown'}] [Predictor] Generated ${predictions.length} grouped predictions`);
 
   // Save prediction if user is logged in
   if (userId) {
@@ -249,7 +375,14 @@ router.get('/history/:id', authenticate, asyncHandler(async (req, res) => {
   }
 
   const prediction = predictions[0];
-  prediction.results = JSON.parse(prediction.results);
+  
+  // Safely parse JSON results
+  try {
+    prediction.results = JSON.parse(prediction.results);
+  } catch (error) {
+    console.error(`[Predictor] Error parsing prediction results for ID ${id}:`, error);
+    prediction.results = [];
+  }
 
   res.json({
     success: true,

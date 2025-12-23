@@ -20,11 +20,31 @@ import { errorHandler } from './middleware/errorHandler.js';
 // Load environment variables
 dotenv.config();
 
+// Validate required environment variables
+const requiredEnvVars = ['JWT_SECRET'];
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingVars.join(', '));
+  console.error('⚠️  Please set these in your .env file');
+  if (process.env.NODE_ENV === 'production') {
+    process.exit(1);
+  } else {
+    console.warn('⚠️  Continuing in development mode, but some features may not work');
+  }
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Security middleware
 app.use(helmet());
+
+// Response compression (if compression package is installed)
+// To install: npm install compression
+// Uncomment the following lines after installing:
+// import compression from 'compression';
+// app.use(compression());
 
 // CORS configuration
 app.use(cors({
@@ -44,9 +64,12 @@ app.use('/api/', limiter);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Request logging middleware
+// Request ID tracking middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  // Generate unique request ID for tracking
+  req.id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  res.setHeader('X-Request-ID', req.id);
+  console.log(`[${req.id}] ${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
 });
 

@@ -33,6 +33,15 @@ const Chatbot = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
+  const formatResponseText = (text: string) => {
+    if (!text) return "";
+    // Strip markdown bold/italics markers and normalize bullet points
+    const withoutBold = text.replace(/\*\*/g, "");
+    const withoutItalics = withoutBold.replace(/(^|\s)[*_]([^*_]+)[*_](?=\s|$)/g, "$1$2");
+    const normalizedBullets = withoutItalics.replace(/^\s*-\s+/gm, "• ").replace(/^\s*\*\s+/gm, "• ");
+    return normalizedBullets.trim();
+  };
+
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
@@ -58,7 +67,7 @@ const Chatbot = () => {
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
-        content: response.response,
+        content: formatResponseText(response.response),
         timestamp: new Date(response.timestamp),
       };
       

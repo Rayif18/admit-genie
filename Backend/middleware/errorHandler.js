@@ -1,7 +1,13 @@
 // Centralized error handling middleware
 
 export const errorHandler = (err, req, res, next) => {
-  console.error('Error:', err);
+  const requestId = req.id || 'unknown';
+  console.error(`[${requestId}] Error:`, {
+    message: err.message,
+    stack: err.stack,
+    code: err.code,
+    name: err.name
+  });
 
   // Default error
   let error = { ...err };
@@ -38,7 +44,11 @@ export const errorHandler = (err, req, res, next) => {
   res.status(error.statusCode || 500).json({
     success: false,
     message: error.message || 'Server Error',
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+    requestId: requestId,
+    ...(process.env.NODE_ENV === 'development' && { 
+      stack: err.stack,
+      details: err 
+    })
   });
 };
 

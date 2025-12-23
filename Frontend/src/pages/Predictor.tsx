@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -11,20 +11,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { GraduationCap, TrendingUp, CheckCircle, AlertCircle, Sparkles } from "lucide-react";
+import { GraduationCap, TrendingUp, CheckCircle, AlertCircle, Sparkles, Loader2 } from "lucide-react";
 import Navigation from "@/components/Navigation";
 import { Progress } from "@/components/ui/progress";
-import { predictorAPI } from "@/lib/api";
+import { predictorAPI, type Prediction, type CourseOption } from "@/lib/api";
 import { toast } from "sonner";
 
-interface College {
-  college_name: string;
-  course_name: string;
-  last_year_cutoff: number;
-  probability: number;
-  category: "safe" | "moderate" | "reach";
-  fees: number;
-  location: string;
+// Types are now imported from api.ts
+interface PredictionWithSelection extends Prediction {
+  selectedCourseId?: number | null;
 }
 
 const Predictor = () => {
@@ -33,7 +28,8 @@ const Predictor = () => {
   const [course, setCourse] = useState("");
   const [showResults, setShowResults] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [results, setResults] = useState<College[]>([]);
+  const [results, setResults] = useState<PredictionWithSelection[]>([]);
+  const [changingCourse, setChangingCourse] = useState<Set<number>>(new Set());
 
   const handlePredict = async () => {
     if (!rank || !category) {
@@ -44,6 +40,12 @@ const Predictor = () => {
     const rankNum = parseInt(rank);
     if (isNaN(rankNum) || rankNum < 1) {
       toast.error("Please enter a valid rank (must be a positive number)");
+      return;
+    }
+
+    // Validate maximum rank
+    if (rankNum > 1000000) {
+      toast.error("Please enter a valid rank (maximum 1,000,000)");
       return;
     }
 
@@ -72,7 +74,12 @@ const Predictor = () => {
       );
 
       if (response.predictions && response.predictions.length > 0) {
-        setResults(response.predictions);
+        const normalizedResults: PredictionWithSelection[] = response.predictions.map((item: Prediction) => ({
+          ...item,
+          selectedCourseId: item.defaultCourseId || item.availableCourses?.[0]?.id || null,
+        }));
+
+        setResults(normalizedResults);
         setShowResults(true);
         toast.success(`Found ${response.predictions.length} college predictions!`);
       } else {
@@ -82,7 +89,20 @@ const Predictor = () => {
       }
     } catch (error: any) {
       console.error("Predictor error:", error);
-      const errorMessage = error.response?.data?.message || error.message || "Failed to get predictions";
+      
+      // Provide more user-friendly error messages
+      let errorMessage = "Failed to get predictions";
+      
+      if (error.status === 400) {
+        errorMessage = "Invalid input. Please check your rank and category.";
+      } else if (error.status === 429) {
+        errorMessage = "Too many requests. Please wait a moment and try again.";
+      } else if (error.status >= 500) {
+        errorMessage = "Server error. Please try again later.";
+      } else if (error.message) {
+        errorMessage = error.message;
+      }
+      
       toast.error(errorMessage);
       setShowResults(false);
     } finally {
@@ -91,12 +111,13 @@ const Predictor = () => {
   };
 
   const getCategoryColor = (cat: string) => {
-    switch (cat) {
+    const normalized = cat === "reach" ? "difficult" : cat;
+    switch (normalized) {
       case "safe":
         return "text-green-500 bg-green-500/10 border-green-500/20";
       case "moderate":
         return "text-yellow-500 bg-yellow-500/10 border-yellow-500/20";
-      case "reach":
+      case "difficult":
         return "text-orange-500 bg-orange-500/10 border-orange-500/20";
       default:
         return "";
@@ -104,21 +125,105 @@ const Predictor = () => {
   };
 
   const getCategoryIcon = (cat: string) => {
-    switch (cat) {
+    const normalized = cat === "reach" ? "difficult" : cat;
+    switch (normalized) {
       case "safe":
         return <CheckCircle className="w-4 h-4" />;
       case "moderate":
         return <TrendingUp className="w-4 h-4" />;
-      case "reach":
+      case "difficult":
         return <AlertCircle className="w-4 h-4" />;
       default:
         return null;
     }
   };
 
-  const formatFees = (fees: number) => {
-    if (!fees) return "N/A";
-    return `₹${fees.toLocaleString('en-IN')}/year`;
+  const formatFees = (fees?: number | null) => {
+    if (!fees && fees !== 0) return "N/A";
+    return `₹${Number(fees).toLocaleString("en-IN")}/year`;
+  };
+
+  const handleCourseChange = (collegeId: number, courseId: number) => {
+    // Add loading state
+    setChangingCourse(prev => new Set(prev).add(collegeId));
+    
+    // Simulate slight delay for better UX (course data is already loaded)
+    setTimeout(() => {
+      setResults((prev) =>
+        prev.map((college) =>
+          college.college_id === collegeId
+            ? { ...college, selectedCourseId: courseId }
+            : college
+        )
+      );
+      setChangingCourse(prev => {
+        const next = new Set(prev);
+        next.delete(collegeId);
+        return next;
+      });
+    }, 150);
+  };
+
+  const getSelectedCourse = (college: PredictionWithSelection): CourseOption | undefined => {
+    return (
+      college.availableCourses.find((c) => c.id === college.selectedCourseId) ||
+      college.availableCourses[0]
+    );
+  };
+
+  const hasResults = useMemo(() => results.length > 0, [results]);
+
+  const handleDownloadReport = () => {
+    if (!results.length) {
+      toast.error("No predictions to download");
+      return;
+    }
+
+    // Generate CSV content
+    const headers = ["College Name", "Location", "Course", "Category", "Admission Probability", "Last Year Cutoff", "Annual Fees"];
+    const rows = results.map((college) => {
+      const selectedCourse = getSelectedCourse(college);
+      if (!selectedCourse) return null;
+      
+      return [
+        college.college_name,
+        college.location,
+        selectedCourse.branch,
+        selectedCourse.category.toUpperCase(),
+        `${selectedCourse.admissionProbability}%`,
+        selectedCourse.closing_rank ? `Rank ${selectedCourse.closing_rank}` : "N/A",
+        formatFees(selectedCourse.fees_per_year)
+      ];
+    }).filter(row => row !== null);
+
+    // Escape special characters in CSV
+    const escapeCSV = (value: any): string => {
+      if (value === null || value === undefined) return "";
+      const str = String(value);
+      // Replace quotes with double quotes and wrap in quotes if contains comma, quote, or newline
+      if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const csvContent = [
+      headers.map(escapeCSV).join(","),
+      ...rows.map(row => row.map(escapeCSV).join(","))
+    ].join("\n");
+
+    // Create and download file
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", `college-predictions-rank-${rank}-${category}-${new Date().toISOString().split('T')[0]}.csv`);
+    link.style.visibility = "hidden";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    
+    toast.success("Report downloaded successfully!");
   };
 
   return (
@@ -244,67 +349,98 @@ const Predictor = () => {
               </Card>
             )}
 
-            {showResults && !isLoading && results.length > 0 && (
+            {showResults && !isLoading && hasResults && (
               <div className="space-y-4">
                 <div className="flex items-center justify-between mb-4 animate-fade-in">
                   <h2 className="text-2xl font-bold">Your College Predictions</h2>
-                  <Button variant="glass">Download Report</Button>
+                  <Button variant="glass" onClick={handleDownloadReport}>
+                    Download Report
+                  </Button>
                 </div>
 
-                {results.map((college, index) => (
-                  <Card
-                    key={index}
-                    className="p-6 bg-card/50 backdrop-blur-sm border-border/50 hover:shadow-glow transition-all duration-300 animate-fade-in"
-                    style={{ animationDelay: `${index * 0.1}s` }}
-                  >
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-3 mb-2">
-                          <h3 className="text-lg font-semibold">{college.college_name}</h3>
-                          <span
-                            className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium border ${getCategoryColor(
-                              college.category
-                            )}`}
-                          >
-                            {getCategoryIcon(college.category)}
-                            {college.category.toUpperCase()}
-                          </span>
+                {results.map((college, index) => {
+                  const selectedCourse = getSelectedCourse(college);
+                  if (!selectedCourse) return null;
+
+                  return (
+                    <Card
+                      key={`college-${college.college_id}-${index}`}
+                      className="p-6 bg-card/50 backdrop-blur-sm border-border/50 hover:shadow-glow transition-all duration-300 animate-fade-in"
+                      style={{ animationDelay: `${index * 0.1}s` }}
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-3 mb-2">
+                            <h3 className="text-lg font-semibold">{college.college_name}</h3>
+                            <span
+                              className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium border ${getCategoryColor(
+                                selectedCourse.category
+                              )}`}
+                            >
+                              {getCategoryIcon(selectedCourse.category)}
+                              {(
+                                selectedCourse.category === "reach"
+                                  ? "DIFFICULT"
+                                  : selectedCourse.category
+                              ).toUpperCase()}
+                            </span>
+                          </div>
+
+                          <p className="text-sm text-muted-foreground mb-3">{college.location}</p>
+
+                          <div className="grid grid-cols-2 gap-4 mb-4">
+                            <div>
+                              <p className="text-xs text-muted-foreground">Select Course</p>
+                              <Select
+                                value={selectedCourse.id.toString()}
+                                onValueChange={(value) => handleCourseChange(college.college_id, Number(value))}
+                                disabled={college.availableCourses.length === 0 || changingCourse.has(college.college_id)}
+                              >
+                                <SelectTrigger className="mt-1">
+                                  <SelectValue placeholder="Select course" />
+                                  {changingCourse.has(college.college_id) && (
+                                    <Loader2 className="w-4 h-4 animate-spin text-muted-foreground ml-2" />
+                                  )}
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {college.availableCourses.map((courseOption) => (
+                                    <SelectItem key={courseOption.id} value={courseOption.id.toString()}>
+                                      {courseOption.branch}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            </div>
+                            <div>
+                              <p className="text-xs text-muted-foreground">Annual Fees</p>
+                              <p className="text-sm font-medium">{formatFees(selectedCourse.fees_per_year)}</p>
+                            </div>
+                            <div>
+                              <p className="text-xs text-muted-foreground">Last Year Cutoff</p>
+                              <p className="text-sm font-medium">
+                                {selectedCourse.closing_rank ? `Rank ${selectedCourse.closing_rank}` : "N/A"}
+                              </p>
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="flex items-center justify-between mb-2">
+                              <p className="text-xs text-muted-foreground">Admission Probability</p>
+                              <p className="text-sm font-semibold">{selectedCourse.admissionProbability}%</p>
+                            </div>
+                            <Progress value={selectedCourse.admissionProbability} className="h-2" />
+                          </div>
                         </div>
 
-                        <p className="text-sm text-muted-foreground mb-3">{college.location}</p>
-
-                        <div className="grid grid-cols-2 gap-4 mb-4">
-                          <div>
-                            <p className="text-xs text-muted-foreground">Course</p>
-                            <p className="text-sm font-medium">{college.course_name}</p>
-                          </div>
-                          <div>
-                            <p className="text-xs text-muted-foreground">Annual Fees</p>
-                            <p className="text-sm font-medium">{formatFees(college.fees)}</p>
-                          </div>
-                          <div>
-                            <p className="text-xs text-muted-foreground">Last Year Cutoff</p>
-                            <p className="text-sm font-medium">Rank {college.last_year_cutoff}</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="flex items-center justify-between mb-2">
-                            <p className="text-xs text-muted-foreground">Admission Probability</p>
-                            <p className="text-sm font-semibold">{college.probability}%</p>
-                          </div>
-                          <Progress value={college.probability} className="h-2" />
-                        </div>
+                        <Link to={`/colleges/${college.college_id}`}>
+                          <Button variant="outline" size="sm">
+                            View Details
+                          </Button>
+                        </Link>
                       </div>
-
-                      <Link to={`/colleges/${college.college_id}`}>
-                        <Button variant="outline" size="sm">
-                          View Details
-                        </Button>
-                      </Link>
-                    </div>
-                  </Card>
-                ))}
+                    </Card>
+                  );
+                })}
               </div>
             )}
 

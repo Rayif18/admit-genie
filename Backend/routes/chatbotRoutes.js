@@ -18,7 +18,25 @@ router.post('/query', [
     return res.status(400).json({ success: false, errors: errors.array() });
   }
 
-  const { query } = req.body;
+  let { query } = req.body;
+  
+  // Sanitize and validate input
+  if (!query || typeof query !== 'string') {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Query is required and must be a string' 
+    });
+  }
+  
+  // Sanitize: trim, limit length, remove potentially harmful characters
+  query = query.trim().slice(0, 5000); // Max 5000 characters
+  
+  if (!query) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Query cannot be empty' 
+    });
+  }
   
   // Try to get user ID from token if present (optional authentication)
   let userId = null;
@@ -128,11 +146,13 @@ router.post('/query', [
 // @desc    Get user's chat history
 // @access  Private
 router.get('/history', authenticate, asyncHandler(async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 20;
+  // Validate and sanitize pagination parameters
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 20), 100); // Max 100 per page
   const offset = (page - 1) * limit;
 
-  // MySQL requires LIMIT and OFFSET to be integers, not parameters
+  // MySQL requires LIMIT and OFFSET to be integers, but we validate them above
+  // Using template literal is safe here because we've validated limit and offset are integers
   const [chats] = await pool.execute(
     `SELECT id, query, response, timestamp FROM chat_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ${limit} OFFSET ${offset}`,
     [req.user.id]

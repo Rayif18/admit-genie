@@ -27,10 +27,35 @@ const apiRequest = async <T>(
     headers,
   });
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    throw new Error('Invalid JSON response from server');
+  }
 
   if (!response.ok) {
-    throw new Error(data.message || 'An error occurred');
+    // Provide more specific error messages based on status code
+    let errorMessage = data.message || 'An error occurred';
+    
+    if (response.status === 400) {
+      errorMessage = data.message || 'Invalid request. Please check your input.';
+    } else if (response.status === 401) {
+      errorMessage = 'Authentication required. Please log in.';
+    } else if (response.status === 403) {
+      errorMessage = 'You do not have permission to perform this action.';
+    } else if (response.status === 404) {
+      errorMessage = 'The requested resource was not found.';
+    } else if (response.status === 429) {
+      errorMessage = 'Too many requests. Please try again later.';
+    } else if (response.status >= 500) {
+      errorMessage = 'Server error. Please try again later.';
+    }
+    
+    const error: any = new Error(errorMessage);
+    error.status = response.status;
+    error.response = data;
+    throw error;
   }
 
   return data;
@@ -106,14 +131,42 @@ export const chatbotAPI = {
   },
 };
 
+// Predictor API Types
+export interface CourseOption {
+  id: number;
+  branch: string;
+  fees_per_year: number | null;
+  closing_rank: number | null;
+  admissionProbability: number;
+  category: "safe" | "moderate" | "reach" | "difficult";
+  duration?: string;
+  eligibility?: string;
+}
+
+export interface Prediction {
+  college_id: number;
+  college_name: string;
+  location: string;
+  ranking?: number;
+  availableCourses: CourseOption[];
+  defaultCourseId?: number | null;
+}
+
+export interface PredictionResponse {
+  success: boolean;
+  predictions: Prediction[];
+  query: {
+    rank: number;
+    category: string;
+    course: string | null;
+  };
+  message?: string;
+}
+
 // Predictor API
 export const predictorAPI = {
-  predict: async (rank: number, category: string, course?: string) => {
-    return apiRequest<{
-      success: boolean;
-      predictions: any[];
-      query: any;
-    }>('/predictor/predict', {
+  predict: async (rank: number, category: string, course?: string): Promise<PredictionResponse> => {
+    return apiRequest<PredictionResponse>('/predictor/predict', {
       method: 'POST',
       body: JSON.stringify({ rank, category, course }),
     });
